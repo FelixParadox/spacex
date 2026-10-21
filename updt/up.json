@@ -1,7 +1,7 @@
 
 {
-  "versionCode": 2,
-  "versionName": "2.1",
+  "versionCode": 1,
+  "versionName": "1.0",
   "apkUrl": "https://github.com/FelixParadox/spacex/raw/refs/heads/main/updt/app-release.apk",
   "changelog": "- Rilis pertama\n- Install Panel, Wings, Node\n- SSH Terminal\n- Background service",
   "forceUpdate": true
