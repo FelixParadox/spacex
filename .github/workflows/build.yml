@@ -1,0 +1,386 @@
+name: Build APK & Register Device Serial
+
+on:
+  workflow_dispatch:
+    inputs:
+      device_serial:
+        description: 'Nomor seri HP (opsional, untuk registrasi)'
+        required: false
+        type: string
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  repository_dispatch:
+    types: [ register_device ]
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-register:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ─────────────────────────────────────────────
+      # 1. Checkout
+      # ─────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ─────────────────────────────────────────────
+      # 2. Setup Java 17
+      # ─────────────────────────────────────────────
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # ─────────────────────────────────────────────
+      # 3. Setup Gradle
+      # ─────────────────────────────────────────────
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      # ─────────────────────────────────────────────
+      # 4. Setup Android SDK
+      # ─────────────────────────────────────────────
+      - name: Set up Android SDK
+        uses: actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-34 build-tools;34.0.0'
+
+      # ─────────────────────────────────────────────
+      # 5. AUTO-DETECT SOURCE (direct / zip / nested folder acak)
+      #    Cari folder yang punya:
+      #      - settings.gradle (atau .kts)
+      #      - app/build.gradle (atau .kts)
+      #      - app/src/main/AndroidManifest.xml
+      # ─────────────────────────────────────────────
+      - name: Detect project source
+        id: detect
+        run: |
+          set -e
+          echo "=== Cek sumber project ==="
+
+          # Helper: validasi folder project
+          is_valid_project() {
+            local d="$1"
+            [ -f "$d/settings.gradle" ] || [ -f "$d/settings.gradle.kts" ] || return 1
+            [ -f "$d/app/build.gradle" ] || [ -f "$d/app/build.gradle.kts" ] || return 1
+            [ -f "$d/app/src/main/AndroidManifest.xml" ] || return 1
+            return 0
+          }
+
+          # A. Cek langsung di repo (tanpa zip)
+          if is_valid_project "$PWD"; then
+            echo "✅ Mode: source langsung di repo root"
+            echo "PROJECT_DIR=$PWD" >> "$GITHUB_OUTPUT"
+            echo "SOURCE_MODE=direct" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # B. Cari zip apa saja di root repo
+          ZIP_FILE=$(find "$PWD" -maxdepth 2 -type f -name "*.zip" \
+            -not -path "*/node_modules/*" -not -path "*/.git/*" | head -n1)
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "❌ Tidak menemukan project valid maupun file .zip"
+            echo "--- Isi direktori ---"
+            ls -la
+            exit 1
+          fi
+
+          echo "📦 Zip ditemukan: $ZIP_FILE"
+
+          # C. Ekstrak ke folder bersih
+          EXTRACT_DIR="$PWD/_source"
+          rm -rf "$EXTRACT_DIR"
+          mkdir -p "$EXTRACT_DIR"
+
+          if ! unzip -q "$ZIP_FILE" -d "$EXTRACT_DIR"; then
+            echo "❌ Gagal ekstrak $ZIP_FILE (zip corrupt?)"
+            exit 1
+          fi
+
+          # D. Cek apakah setelah ekstrak ada folder yang valid
+          #    Kalau ada, langsung di root extract (tanpa sub-folder)
+          if is_valid_project "$EXTRACT_DIR"; then
+            echo "✅ Mode: zip → project langsung di root zip"
+            echo "PROJECT_DIR=$EXTRACT_DIR" >> "$GITHUB_OUTPUT"
+            echo "SOURCE_MODE=zip-direct" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # E. Cari folder valid di mana saja di dalam extract (deep search)
+          CANDIDATE=""
+          while IFS= read -r -d '' manifest; do
+            candidate="$(dirname "$(dirname "$(dirname "$manifest")")")"
+            if is_valid_project "$candidate"; then
+              CANDIDATE="$candidate"
+              break
+            fi
+          done < <(find "$EXTRACT_DIR" -type f -name "AndroidManifest.xml" -print0)
+
+          if [ -n "$CANDIDATE" ]; then
+            echo "✅ Mode: zip → project di $CANDIDATE"
+            echo "PROJECT_DIR=$CANDIDATE" >> "$GITHUB_OUTPUT"
+            echo "SOURCE_MODE=zip-nested" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "❌ Tidak ada folder project valid di dalam $ZIP_FILE"
+          echo "--- Struktur ekstrak ---"
+          find "$EXTRACT_DIR" -maxdepth 4 -type f -name "*.gradle" -o -name "*.gradle.kts" -o -name "AndroidManifest.xml" | head -n20
+          exit 1
+
+      # ─────────────────────────────────────────────
+      # 6. Auto-detect keystore
+      # ─────────────────────────────────────────────
+      - name: Auto-detect keystore
+        id: keystore
+        env:
+          PROJECT_DIR: ${{ steps.detect.outputs.PROJECT_DIR }}
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          set +e
+          echo "=== Cek keberadaan keystore ==="
+
+          # Prioritas 1: secret KEYSTORE_BASE64
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "🔑 Mode: dari secret KEYSTORE_BASE64"
+            mkdir -p "$PROJECT_DIR/keystore"
+            if echo "$KEYSTORE_BASE64" | base64 -d > "$PROJECT_DIR/keystore/myx.jks" 2>/dev/null; then
+              if [ -s "$PROJECT_DIR/keystore/myx.jks" ]; then
+                echo "✅ Keystore dari secret berhasil di-decode"
+                echo "HAS_KEYSTORE=true" >> "$GITHUB_OUTPUT"
+                echo "KEYSTORE_PATH=$PROJECT_DIR/keystore/myx.jks" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            fi
+            echo "⚠️ Secret tidak valid, lanjut cek file lokal..."
+          fi
+
+          # Prioritas 2: file .jks di PROJECT_DIR/keystore/
+          KEYSTORE_PATH=$(find "$PROJECT_DIR/keystore" -maxdepth 1 -name "*.jks" -type f 2>/dev/null | head -n1)
+          if [ -n "$KEYSTORE_PATH" ] && [ -f "$KEYSTORE_PATH" ]; then
+            echo "🔑 Mode: file .jks di $PROJECT_DIR/keystore/"
+            echo "HAS_KEYSTORE=true" >> "$GITHUB_OUTPUT"
+            echo "KEYSTORE_PATH=$KEYSTORE_PATH" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Prioritas 3: file .jks di PROJECT_DIR (root)
+          KEYSTORE_PATH=$(find "$PROJECT_DIR" -maxdepth 1 -name "*.jks" -type f 2>/dev/null | head -n1)
+          if [ -n "$KEYSTORE_PATH" ] && [ -f "$KEYSTORE_PATH" ]; then
+            echo "🔑 Mode: file .jks di root project"
+            echo "HAS_KEYSTORE=true" >> "$GITHUB_OUTPUT"
+            echo "KEYSTORE_PATH=$KEYSTORE_PATH" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Prioritas 4: file .jks di root repo (GITHUB_WORKSPACE)
+          KEYSTORE_PATH=$(find "$GITHUB_WORKSPACE" -maxdepth 2 -name "*.jks" -type f 2>/dev/null | head -n1)
+          if [ -n "$KEYSTORE_PATH" ] && [ -f "$KEYSTORE_PATH" ]; then
+            echo "🔑 Mode: file .jks di root repo"
+            echo "HAS_KEYSTORE=true" >> "$GITHUB_OUTPUT"
+            echo "KEYSTORE_PATH=$KEYSTORE_PATH" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "⚠️ Tidak ada keystore (.jks) ditemukan. Build release akan di-skip."
+          echo "HAS_KEYSTORE=false" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      # ─────────────────────────────────────────────
+      # 7. Align Java 17
+      # ─────────────────────────────────────────────
+      - name: Align Java and Kotlin JVM targets
+        env:
+          PROJECT_DIR: ${{ steps.detect.outputs.PROJECT_DIR }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          proj = Path(os.environ["PROJECT_DIR"]) / "app" / "build.gradle"
+          if not proj.exists():
+              proj = Path(os.environ["PROJECT_DIR"]) / "app" / "build.gradle.kts"
+          if not proj.exists():
+              raise SystemExit(f"❌ Tidak menemukan app/build.gradle(.kts)")
+          s = proj.read_text()
+          if "VERSION_17" in s:
+              print("✅ compileOptions sudah 17")
+          else:
+              pos = s.rfind("\n}")
+              config = """
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = '17' }
+              """
+              proj.write_text(s[:pos] + config + s[pos:])
+              print("✅ compileOptions ditambahkan")
+          PY
+
+      # ─────────────────────────────────────────────
+      # 8. Patch signingConfig → env KEYSTORE_FILE
+      # ─────────────────────────────────────────────
+      - name: Patch build.gradle for keystore
+        if: ${{ steps.keystore.outputs.HAS_KEYSTORE == 'true' }}
+        env:
+          PROJECT_DIR: ${{ steps.detect.outputs.PROJECT_DIR }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          proj = Path(os.environ["PROJECT_DIR"]) / "app" / "build.gradle"
+          if not proj.exists():
+              print("⚠️ build.gradle tidak ditemukan, skip patch")
+              raise SystemExit(0)
+          s = proj.read_text()
+          if 'KEYSTORE_FILE' in s:
+              print("✅ sudah pakai env KEYSTORE_FILE")
+              raise SystemExit(0)
+          pattern = re.compile(r'signingConfigs\s*\{.*?release\s*\{.*?\}\s*\}', re.DOTALL)
+          new_block = '''signingConfigs {
+              release {
+                  def keystorePath = System.getenv("KEYSTORE_FILE") ?: "${rootDir}/keystore/myx.jks"
+                  storeFile file(keystorePath)
+                  storePassword System.getenv("KEYSTORE_PASSWORD") ?: ""
+                  keyAlias System.getenv("KEY_ALIAS") ?: ""
+                  keyPassword System.getenv("KEY_PASSWORD") ?: ""
+              }
+          }'''
+          if pattern.search(s):
+              s = pattern.sub(new_block, s, count=1)
+              proj.write_text(s)
+              print("✅ signingConfigs dipatch")
+          else:
+              print("⚠️ Tidak menemukan blok signingConfigs")
+          PY
+
+      # ─────────────────────────────────────────────
+      # 9. Build Debug
+      # ─────────────────────────────────────────────
+      - name: Build Debug APK
+        working-directory: ${{ steps.detect.outputs.PROJECT_DIR }}
+        run: |
+          if [ -f gradlew ]; then chmod +x gradlew; ./gradlew --no-daemon assembleDebug
+          else gradle --no-daemon assembleDebug; fi
+
+      # ─────────────────────────────────────────────
+      # 10. Build Release
+      # ─────────────────────────────────────────────
+      - name: Build Release APK
+        if: ${{ steps.keystore.outputs.HAS_KEYSTORE == 'true' }}
+        working-directory: ${{ steps.detect.outputs.PROJECT_DIR }}
+        env:
+          KEYSTORE_FILE: ${{ steps.keystore.outputs.KEYSTORE_PATH }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -f gradlew ]; then ./gradlew --no-daemon assembleRelease
+          else gradle --no-daemon assembleRelease; fi
+
+      # ─────────────────────────────────────────────
+      # 11. Upload Debug
+      # ─────────────────────────────────────────────
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: App-Debug
+          path: ${{ steps.detect.outputs.PROJECT_DIR }}/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      # ─────────────────────────────────────────────
+      # 12. Upload Release
+      # ─────────────────────────────────────────────
+      - name: Upload Release APK
+        if: ${{ steps.keystore.outputs.HAS_KEYSTORE == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: App-Release
+          path: ${{ steps.detect.outputs.PROJECT_DIR }}/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      # ─────────────────────────────────────────────
+      # 13. Register device serial (safe JSON handling)
+      # ─────────────────────────────────────────────
+      - name: Register device serial
+        if: ${{ github.event.inputs.device_serial != '' || github.event.client_payload.device_serial != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SERIAL: ${{ github.event.inputs.device_serial || github.event.client_payload.device_serial }}
+        run: |
+          set -e
+          echo "📱 Serial: $SERIAL"
+          SERIAL_FILE="device_serials.json"
+
+          # Ambil SHA + isi file (kalau ada)
+          API="https://api.github.com/repos/$REPO/contents/$SERIAL_FILE"
+          RESP=$(curl -s -H "Authorization: Bearer $GH_TOKEN" "$API")
+
+          SHA=""
+          EXISTING='{"serials":[]}'
+          if echo "$RESP" | grep -q '"content"'; then
+            SHA=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('sha',''))")
+            CONTENT_B64=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['content'].replace('\n',''))")
+            EXISTING=$(echo "$CONTENT_B64" | base64 -d)
+          fi
+
+          # Append jika belum ada
+          NEW_JSON=$(SERIAL="$SERIAL" EXISTING="$EXISTING" python3 - <<'PY'
+          import os, json
+          existing = os.environ["EXISTING"]
+          serial = os.environ["SERIAL"]
+          try:
+              data = json.loads(existing)
+          except Exception:
+              data = {"serials": []}
+          if "serials" not in data:
+              data["serials"] = []
+          if serial not in data["serials"]:
+              data["serials"].append(serial)
+          print(json.dumps(data, indent=2))
+          PY
+          )
+
+          if echo "$EXISTING" | python3 -c "import sys,json; s=sys.argv[1]; print('ok' if s in json.load(sys.stdin).get('serials',[]) else 'no')" "$SERIAL" 2>/dev/null | grep -q '^ok$'; then
+            echo "✅ Serial sudah terdaftar, skip."
+            exit 0
+          fi
+
+          ENCODED=$(echo "$NEW_JSON" | base64 -w0)
+
+          if [ -n "$SHA" ]; then
+            curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" "$API" \
+              -d "{\"message\":\"register device: $SERIAL\",\"content\":\"$ENCODED\",\"sha\":\"$SHA\"}" > /dev/null
+          else
+            curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" "$API" \
+              -d "{\"message\":\"register device: $SERIAL\",\"content\":\"$ENCODED\"}" > /dev/null
+          fi
+
+          echo "✅ Serial $SERIAL terdaftar."
+
+      # ─────────────────────────────────────────────
+      # 14. Auto release kalau push tag v*
+      # ─────────────────────────────────────────────
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') && steps.keystore.outputs.HAS_KEYSTORE == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.detect.outputs.PROJECT_DIR }}/app/build/outputs/apk/release/app-release.apk
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
